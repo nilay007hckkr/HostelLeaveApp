@@ -1,0 +1,6 @@
+Users:
+[('2561143', 'B tech ', '1st', 'A'), ('student_1', 'B tech', '1st', 'A'), ('student_2', '', '', '')]
+CCs:
+[('cc_admin', '', None, ''), ('cc_a', 'B.Tech Computer Science', '1st', 'A'), ('cc_b', 'B.Tech Computer Science', '1st', 'B')]
+Leaves:
+[(1, '2561143', 'Pending CC_B tech _1st_A Approval', 'CC_B tech _1st_A'), (2, 'student_1', 'Pending Class Coordinator Approval', 'Unknown CC')]

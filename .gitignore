@@ -4,3 +4,4 @@ frontend/node_modules/
 # Ignore Python heavy files
 backend/venv/
 backend/__pycache__/
+node_modules
