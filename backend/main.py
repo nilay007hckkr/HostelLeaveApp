@@ -38,7 +38,14 @@ class ProfileUpdate(BaseModel):
     mother_phone: str
     father_phone: str
 
+class PushTokenUpdate(BaseModel):
+    token: str
+
 university_holidays = [date(2026, 3, 21), date(2026, 3, 22)]
+
+def is_holiday_or_weekend(d: date) -> bool:
+    """Returns True if the date is a Saturday, Sunday, or university holiday."""
+    return d.weekday() >= 5 or d in university_holidays
 
 # --- DATABASE SETUP ---
 def setup_database():
@@ -60,12 +67,13 @@ def setup_database():
             mother_phone TEXT,
             father_phone TEXT,
             phone TEXT,
-            profile_complete INTEGER DEFAULT 0
+            profile_complete INTEGER DEFAULT 0,
+            push_token TEXT
         )
     ''')
 
     # Add new columns to existing DB if they don't exist (migration safety)
-    for col, col_type in [('semester', 'TEXT'), ('phone', 'TEXT'), ('profile_complete', 'INTEGER DEFAULT 0')]:
+    for col, col_type in [('semester', 'TEXT'), ('phone', 'TEXT'), ('profile_complete', 'INTEGER DEFAULT 0'), ('push_token', 'TEXT')]:
         try:
             cursor.execute(f'ALTER TABLE users ADD COLUMN {col} {col_type}')
         except Exception:
@@ -106,11 +114,19 @@ def setup_database():
             ('student_2', 'student', 'pass', 'Bob (Pending Profile)', '', '', '', '', '', '', '', '', 0),
             ('cc_a', 'cc', 'pass', 'Prof. Alpha (CC Sec A)', 'BTech', '1st', 'A', '', '', '', '', '9870000001', 1),
             ('cc_b', 'cc', 'pass', 'Prof. Beta (CC Sec B)', 'BTech', '1st', 'B', '', '', '', '', '9870000002', 1),
-            ('warden_main', 'warden', 'pass', 'Chief Warden', '', '', '', '', '', '', '', '9999999999', 1)
+            ('warden_bh1', 'warden', 'pass', 'Warden BH1', '', '', '', 'Boys Hostel 1', '', '', '', '9999999991', 1),
+            ('warden_gh1', 'warden', 'pass', 'Warden GH1', '', '', '', 'Girls Hostel 1', '', '', '', '9999999992', 1)
         ])
         
     conn.commit()
     conn.close()
+
+    # Normalize any stale course names left from old data entry so CC matching works
+    conn2 = sqlite3.connect("hostel_records.db")
+    c2 = conn2.cursor()
+    c2.execute("UPDATE users SET course = 'BTech' WHERE LOWER(TRIM(course)) IN ('b tech', 'b.tech', 'b.tech computer science', 'btech')")
+    conn2.commit()
+    conn2.close()
 
 setup_database()
 
@@ -128,7 +144,8 @@ def force_seed_database():
         ('student_2', 'student', 'pass', 'Bob (Pending Profile)', '', '', '', '', '', '', '', '', 0),
         ('cc_a', 'cc', 'pass', 'Prof. Alpha (CC Sec A)', 'BTech', '1st', 'A', '', '', '', '', '9870000001', 1),
         ('cc_b', 'cc', 'pass', 'Prof. Beta (CC Sec B)', 'BTech', '1st', 'B', '', '', '', '', '9870000002', 1),
-        ('warden_main', 'warden', 'pass', 'Chief Warden', '', '', '', '', '', '', '', '9999999999', 1)
+        ('warden_bh1', 'warden', 'pass', 'Warden BH1', '', '', '', 'Boys Hostel 1', '', '', '', '9999999991', 1),
+        ('warden_gh1', 'warden', 'pass', 'Warden GH1', '', '', '', 'Girls Hostel 1', '', '', '', '9999999992', 1)
     ])
     conn.commit()
     conn.close()
@@ -204,11 +221,25 @@ def submit_leave_request(request: LeaveRequest):
         assigned_cc = "Unknown CC"
         current_status = f"Pending Class Coordinator Approval"
 
-    if request.leave_date in university_holidays:
+    if is_holiday_or_weekend(request.leave_date):
         current_status = "Pending Warden Approval"
-        routing_message = "Holiday detected. Bypassing CC, sent directly to Warden."
+        day_type = "weekend" if request.leave_date.weekday() >= 5 else "university holiday"
+        routing_message = f"Leave date falls on a {day_type}. Bypassing CC — sent directly to Warden."
+
+        # Notify Warden directly
+        cursor.execute("SELECT push_token FROM users WHERE role='warden' AND hostel=(SELECT hostel FROM users WHERE user_id=?)", (request.student_id,))
+        for w in cursor.fetchall():
+            send_push_notification(w[0], "🛡️ New Leave Request", f"A student requested leave on a {day_type}. No CC required.")
+
     else:
-        routing_message = f"Working day. Sent to Class Coordinator."
+        routing_message = "Working day. Sent to Class Coordinator for approval."
+
+        # Notify CC (only if one was matched)
+        if assigned_cc != "Unknown CC":
+            cursor.execute("SELECT push_token FROM users WHERE user_id=?", (assigned_cc,))
+            cc_row = cursor.fetchone()
+            if cc_row and cc_row[0]:
+                send_push_notification(cc_row[0], "🔔 New Leave Request", "A student from your section has requested leave.")
 
     cursor.execute('''
         INSERT INTO leave_requests (student_id, destination, reason, leave_date, arrival_date, requires_transport, status, assigned_cc)
@@ -265,7 +296,35 @@ def get_student_cc_info(student_id: str):
 def update_leave_status(request_id: int, new_status: str):
     conn = sqlite3.connect("hostel_records.db")
     cursor = conn.cursor()
+    
+    # 1. Update the request
     cursor.execute('UPDATE leave_requests SET status = ? WHERE id = ?', (new_status, request_id))
+    
+    # 2. Fire Push Notifications
+    cursor.execute('SELECT student_id, (SELECT hostel FROM users WHERE user_id=leave_requests.student_id) as hostel FROM leave_requests WHERE id = ?', (request_id,))
+    req = cursor.fetchone()
+    
+    if req:
+        student_id, hostel = req
+        if "Pending Warden" in new_status:
+            # CC Approved → Notify the student's hostel Warden
+            cursor.execute("SELECT push_token FROM users WHERE role='warden' AND hostel=?", (hostel,))
+            for w in cursor.fetchall():
+                send_push_notification(w[0], "🛡️ CC Approved Leave", "A request has been approved by CC and is ready for your final decision.")
+        elif "APPROVED" in new_status:
+            # Warden fully approved → Notify student
+            cursor.execute("SELECT push_token FROM users WHERE user_id=?", (student_id,))
+            student = cursor.fetchone()
+            if student and student[0]:
+                send_push_notification(student[0], "✅ Leave Approved!", "Your leave request has been fully approved by the Warden.")
+        elif "REJECTED" in new_status:
+            # CC or Warden rejected → Notify student
+            rejected_by = "Warden" if "Warden" in new_status else "Class Coordinator"
+            cursor.execute("SELECT push_token FROM users WHERE user_id=?", (student_id,))
+            student = cursor.fetchone()
+            if student and student[0]:
+                send_push_notification(student[0], "❌ Leave Rejected", f"Your leave request was rejected by the {rejected_by}.")
+
     conn.commit()
     conn.close()
     return {"success": True, "message": f"Leave Request #{request_id} updated to {new_status}"}
@@ -276,8 +335,8 @@ def view_all_leaves():
     conn.row_factory = sqlite3.Row 
     cursor = conn.cursor()
     
-    # 1. Delete requests for past leave dates (optional cleanup)
-    cursor.execute("DELETE FROM leave_requests WHERE leave_date < date('now', 'localtime')")
+    # 1. Auto-expire requests with a past leave date that are still pending
+    cursor.execute("UPDATE leave_requests SET status = 'Expired (Past Date)' WHERE status LIKE 'Pending%' AND leave_date < date('now', 'localtime')")
     
     # 2. Auto-expire pending requests older than 24 hours
     cursor.execute("UPDATE leave_requests SET status = 'Expired (24h Timeout)' WHERE status LIKE 'Pending%' AND created_at <= datetime('now', '-24 hours')")
@@ -294,6 +353,30 @@ def view_all_leaves():
     conn.close()
     
     return {"total_requests": len(all_records), "data": [dict(row) for row in all_records]}
+
+@app.put("/user/{user_id}/push-token")
+def update_push_token(user_id: str, payload: PushTokenUpdate):
+    conn = sqlite3.connect("hostel_records.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET push_token = ? WHERE user_id = ?", (payload.token, user_id))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+import urllib.request
+import json
+
+def send_push_notification(token: str, title: str, body: str):
+    if not token: return
+    try:
+        req = urllib.request.Request(
+            "https://exp.host/--/api/v2/push/send",
+            data=json.dumps({"to": token, "title": title, "body": body}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception as e:
+        print(f"Push Notification Error: {e}")
 
 # --- WARDEN DASHBOARD ---
 @app.get("/warden", response_class=HTMLResponse)
